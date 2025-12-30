@@ -2,10 +2,34 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
+const http = require('http');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// --- Configuration CORS ---
+// ================= CONFIGURATION =================
+const CONFIG = {
+    // URL de base des serveurs officiels
+    MOJANG_ASSETS: 'https://resources.download.minecraft.net',
+    MOJANG_LIBRARIES: 'https://libraries.minecraft.net',
+    FORGE_MAVEN: 'https://maven.minecraftforge.net',
+    FORGE_MAVEN_FALLBACK: 'https://files.minecraftforge.net/maven',
+    
+    // Mappings des fichiers Forge
+    FORGE_MAPPINGS: {
+        'net/minecraftforge/forge': 'https://maven.minecraftforge.net/net/minecraftforge/forge',
+        'net/minecraftforge/fancymodloader': 'https://maven.minecraftforge.net/net/minecraftforge/fancymodloader',
+        'net/minecraftforge/eventbus': 'https://maven.minecraftforge.net/net/minecraftforge/eventbus',
+        'net/minecraftforge/common': 'https://maven.minecraftforge.net/net/minecraftforge/common',
+        'cpw/mods': 'https://maven.minecraftforge.net/cpw/mods',
+        'org/ow2/asm': 'https://repo1.maven.org/maven2/org/ow2/asm'
+    },
+    
+    // Cache des fichiers téléchargés
+    CACHE_DIR: path.join(__dirname, 'cache'),
+    CACHE_TTL: 24 * 60 * 60 * 1000, // 24 heures
+};
+
+// ================= MIDDLEWARE =================
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -13,302 +37,498 @@ app.use((req, res, next) => {
     next();
 });
 
-// --- 1. Route Principale : Liste des fichiers (RETOURNE UN TABLEAU) ---
+app.use(express.json());
+
+// Créer le dossier cache
+if (!fs.existsSync(CONFIG.CACHE_DIR)) {
+    fs.mkdirSync(CONFIG.CACHE_DIR, { recursive: true });
+}
+
+// ================= FONCTIONS UTILITAIRES =================
+
+/**
+ * Télécharge un fichier depuis une URL et le sauvegarde
+ */
+async function downloadAndCache(url, destination) {
+    return new Promise((resolve, reject) => {
+        const protocol = url.startsWith('https') ? https : http;
+        const tempFile = destination + '.tmp';
+        
+        // Vérifier si déjà en cache et valide
+        if (fs.existsSync(destination)) {
+            const stats = fs.statSync(destination);
+            const age = Date.now() - stats.mtimeMs;
+            
+            if (age < CONFIG.CACHE_TTL && stats.size > 0) {
+                console.log(`✅ Utilisation du cache: ${path.basename(destination)}`);
+                return resolve(true);
+            }
+        }
+        
+        console.log(`🌐 Téléchargement depuis: ${url}`);
+        
+        const fileStream = fs.createWriteStream(tempFile);
+        const request = protocol.get(url, (response) => {
+            if (response.statusCode === 200) {
+                response.pipe(fileStream);
+                
+                fileStream.on('finish', () => {
+                    fileStream.close();
+                    
+                    // Renommer le fichier temporaire
+                    fs.renameSync(tempFile, destination);
+                    
+                    console.log(`✅ Téléchargé et caché: ${path.basename(destination)} (${response.headers['content-length']} bytes)`);
+                    resolve(true);
+                });
+            } else {
+                fileStream.close();
+                fs.unlinkSync(tempFile);
+                console.log(`❌ Échec téléchargement (${response.statusCode}): ${url}`);
+                resolve(false);
+            }
+        });
+        
+        request.on('error', (error) => {
+            fileStream.close();
+            if (fs.existsSync(tempFile)) {
+                fs.unlinkSync(tempFile);
+            }
+            console.log(`❌ Erreur connexion: ${error.message}`);
+            resolve(false);
+        });
+        
+        request.setTimeout(30000, () => {
+            request.destroy();
+            fileStream.close();
+            if (fs.existsSync(tempFile)) {
+                fs.unlinkSync(tempFile);
+            }
+            console.log(`⏱️ Timeout: ${url}`);
+            resolve(false);
+        });
+    });
+}
+
+/**
+ * Trouve l'URL correcte pour un fichier
+ */
+function resolveFileUrl(filePath, fileName) {
+    // 1. Assets Minecraft (hash SHA1)
+    if (fileName.length === 40 && /^[0-9a-f]{40}$/.test(fileName) && 
+        filePath.includes('assets/objects/')) {
+        const prefix = fileName.substring(0, 2);
+        return `${CONFIG.MOJANG_ASSETS}/${prefix}/${fileName}`;
+    }
+    
+    // 2. Libraries Minecraft
+    if (filePath.includes('libraries/')) {
+        // Libraries standard Minecraft
+        if (filePath.includes('com/mojang') || 
+            filePath.includes('net/minecraft') ||
+            filePath.includes('it/unimi/dsi')) {
+            return `${CONFIG.MOJANG_LIBRARIES}/${filePath}`;
+        }
+        
+        // Libraries Forge
+        for (const [prefix, baseUrl] of Object.entries(CONFIG.FORGE_MAPPINGS)) {
+            if (filePath.includes(prefix)) {
+                const relativePath = filePath.split(prefix)[1];
+                return `${baseUrl}${relativePath}`;
+            }
+        }
+        
+        // Fallback général pour les libraries
+        return `${CONFIG.MOJANG_LIBRARIES}/${filePath}`;
+    }
+    
+    // 3. Fichiers Forge spécifiques
+    if (fileName.includes('forge') || fileName.includes('minecraftforge')) {
+        if (filePath.includes('versions/') && fileName.endsWith('.jar')) {
+            const versionMatch = filePath.match(/versions\/([^\/]+)\//);
+            if (versionMatch) {
+                const version = versionMatch[1];
+                return `${CONFIG.FORGE_MAVEN}/net/minecraftforge/forge/${version}/${fileName}`;
+            }
+        }
+    }
+    
+    // 4. Fichier client Minecraft
+    if (fileName === `${path.basename(path.dirname(filePath))}.jar` && 
+        filePath.includes('versions/')) {
+        const version = path.basename(path.dirname(filePath));
+        return `https://launcher.mojang.com/v1/objects/client/${version}.jar`;
+    }
+    
+    // 5. Par défaut, retourner null (fichier local uniquement)
+    return null;
+}
+
+/**
+ * Vérifie si un fichier existe sur un serveur distant
+ */
+async function checkRemoteFile(url) {
+    return new Promise((resolve) => {
+        const protocol = url.startsWith('https') ? https : http;
+        const request = protocol.request(url, { method: 'HEAD' }, (response) => {
+            resolve(response.statusCode === 200 || response.statusCode === 206);
+        });
+        
+        request.on('error', () => resolve(false));
+        request.setTimeout(5000, () => {
+            request.destroy();
+            resolve(false);
+        });
+        
+        request.end();
+    });
+}
+
+// ================= ROUTES PRINCIPALES =================
+
+// 1. Configuration des instances
+app.get('/files/instances.json', (req, res) => {
+    console.log('📋 Configuration instances demandée');
+    
+    const config = {
+        "zendariom": {
+            "name": "zendariom",
+            "url": `https://${req.get('host')}/files?instance=zendariom`,
+            "loadder": {
+                "minecraft_version": "1.20.1",
+                "loadder_type": "Forge", // IMPORTANT: Forge
+                "loadder_version": "latest"
+            },
+            "verify": true,
+            "ignored": [
+                "config",
+                "logs", 
+                "resourcepacks",
+                "options.txt",
+                "optionsof.txt",
+                "**/*.x", // Ignorer fichiers temporaires
+                "**/natives/**/*.tmp"
+            ],
+            "whitelist": ["Luuxis"],
+            "whitelistActive": false,
+            "status": {
+                "nameServer": "ZENDARIOM",
+                "ip": "91.197.6.16",
+                "port": 26710
+            },
+            "features": {
+                "auto_download": true,
+                "forge_fallback": true,
+                "cache_enabled": true
+            }
+        }
+    };
+    
+    res.json(config);
+});
+
+// 2. Liste des fichiers avec URLs intelligentes
 app.get('/files/', (req, res) => {
     const instanceName = req.query.instance;
-    if (!instanceName) return res.json([]); // Retourne un tableau vide
-
+    if (!instanceName) return res.json([]);
+    
     const instancePath = path.join(__dirname, 'files', 'instances', instanceName);
-    console.log(`🔍 Scan de l'instance: "${instanceName}"`);
-
+    console.log(`🔍 Scan instance: ${instanceName}`);
+    
     if (!fs.existsSync(instancePath)) {
-        console.log(`❌ Instance non trouvée.`);
         return res.json([]);
     }
 
     function scanDirectory(dir, basePath = '') {
         const results = [];
+        
         try {
             const items = fs.readdirSync(dir);
+            
             for (const item of items) {
                 const fullPath = path.join(dir, item);
                 const relativePath = basePath ? `${basePath}/${item}` : item;
-
+                
                 try {
                     const stats = fs.statSync(fullPath);
-
+                    
                     if (stats.isDirectory()) {
-                        // Scanner récursivement les sous-dossiers
-                        results.push(...scanDirectory(fullPath, relativePath));
-                    } else {
-                        // IGNORE les fichiers temporaires .x et JNA
-                        if (item.endsWith('.x') || (item.startsWith('jna') && item.includes('.dll'))) {
-                            console.log(`   ⚠️ Ignoré (fichier temp): ${relativePath}`);
+                        // Ignorer les dossiers natives vides
+                        if (relativePath.includes('/natives') && 
+                            fs.readdirSync(fullPath).length === 0) {
                             continue;
                         }
-
-                        let fileUrl;
-                        // Détection d'un hash SHA1 (Asset Minecraft)
-                        if (item.length === 40 && /^[0-9a-f]{40}$/.test(item) && relativePath.includes('assets/objects/')) {
-                            const prefix = item.substring(0, 2);
-                            fileUrl = `https://resources.download.minecraft.net/${prefix}/${item}`; // URL Mojang
-                        } else {
-                            // Pour tous les autres fichiers (libs, configs, mods...)
-                            fileUrl = `https://${req.get('host')}/files/instances/${instanceName}/${relativePath.replace(/\\/g, '/')}`;
+                        results.push(...scanDirectory(fullPath, relativePath));
+                    } else {
+                        // Ignorer fichiers temporaires
+                        if (item.endsWith('.x') || item.includes('.tmp')) {
+                            continue;
                         }
-
+                        
+                        const fileUrl = resolveFileUrl(relativePath, item);
+                        
                         results.push({
                             name: item,
                             path: relativePath.replace(/\\/g, '/'),
                             size: stats.size,
-                            url: fileUrl,
+                            url: fileUrl || `https://${req.get('host')}/files/instances/${instanceName}/${relativePath.replace(/\\/g, '/')}`,
                             type: 'file',
-                            modified: stats.mtime.toISOString()
+                            modified: stats.mtime.toISOString(),
+                            source: fileUrl ? 'remote' : 'local',
+                            hash: item.length === 40 && /^[0-9a-f]{40}$/.test(item) ? item : null
                         });
                     }
-                } catch (err) { /* Ignorer les erreurs de fichier individuel */ }
+                } catch (error) {
+                    // Ignorer les erreurs
+                }
             }
-        } catch (err) { /* Ignorer les erreurs de dossier */ }
+        } catch (error) {
+            console.log(`⚠️ Erreur scan: ${error.message}`);
+        }
+        
         return results;
     }
 
     try {
-        const fileList = scanDirectory(instancePath);
-        console.log(`✅ ${fileList.length} fichiers valides listés.`);
-        res.json(fileList); // CRITIQUE : Retourne directement le tableau.
+        const files = scanDirectory(instancePath);
+        console.log(`✅ ${files.length} fichiers listés (${files.filter(f => f.source === 'remote').length} depuis serveurs distants)`);
+        res.json(files);
     } catch (error) {
-        console.error('❌ Erreur lors du scan:', error);
-        res.status(500).json([]);
+        console.error('❌ Erreur:', error);
+        res.json([]);
     }
 });
 
-// --- 2. Route de Téléchargement Intelligent avec Fallback ---
-app.get('/files/instances/:instance/*', (req, res) => {
+// 3. Téléchargement intelligent avec fallback Forge
+app.get('/files/instances/:instance/*', async (req, res) => {
     const instanceName = req.params.instance;
     const filePath = req.params[0];
     const fullLocalPath = path.join(__dirname, 'files', 'instances', instanceName, filePath);
-    const filename = path.basename(filePath);
-
-    console.log(`📥 Demande: /${filePath}`);
-
-    // STRATÉGIE : Gestion des fichiers temporaires (.x)
-    if (filename.endsWith('.x') || (filename.startsWith('jna') && filename.includes('.dll'))) {
-        console.log(`   🛡️  Fichier temporaire détecté. Réponse avec placeholder vide.`);
-        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': '0' });
+    const fileName = path.basename(filePath);
+    
+    console.log(`📥 Demande: ${filePath}`);
+    
+    // Gestion fichiers temporaires
+    if (fileName.endsWith('.x') || fileName.includes('.tmp')) {
+        res.writeHead(200, { 
+            'Content-Type': 'application/octet-stream', 
+            'Content-Length': '0' 
+        });
         return res.end();
     }
-
-    const isMinecraftAsset = filename.length === 40 && /^[0-9a-f]{40}$/.test(filename) && filePath.includes('assets/objects/');
-    const isLikelyNative = filePath.includes('/natives/') && (filename.endsWith('.dll') || filename.endsWith('.so') || filename.endsWith('.dylib'));
-
-    // Étape 1 : Servir depuis le système de fichiers local
+    
+    // Étape 1: Vérifier localement
     if (fs.existsSync(fullLocalPath)) {
         const stats = fs.statSync(fullLocalPath);
         if (stats.size > 0) {
-            console.log(`   ✅ Servi depuis le cache local (${stats.size} octets).`);
+            console.log(`✅ Servi localement: ${stats.size} bytes`);
             return res.sendFile(fullLocalPath);
         }
     }
-
-    // Étape 2 : Pour les assets Minecraft, proxy vers Mojang
-    if (isMinecraftAsset) {
-        const prefix = filename.substring(0, 2);
-        const mojangUrl = `https://resources.download.minecraft.net/${prefix}/${filename}`;
-        console.log(`   🌐 Proxy vers Mojang: ${mojangUrl}`);
-
-        const reqToMojang = https.get(mojangUrl, (mojangRes) => {
-            if (mojangRes.statusCode === 200) {
-                // 1. Streamer la réponse au client
-                res.writeHead(200, {
-                    'Content-Type': mojangRes.headers['content-type'] || 'application/octet-stream',
-                    'Content-Length': mojangRes.headers['content-length']
-                });
-                mojangRes.pipe(res);
-
-                // 2. Sauvegarder en cache pour la prochaine fois
-                const dir = path.dirname(fullLocalPath);
-                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-                const fileStream = fs.createWriteStream(fullLocalPath);
-                mojangRes.pipe(fileStream);
-                fileStream.on('finish', () => {
-                    console.log(`   💾 Asset sauvegardé en cache: ${filename}`);
-                    fileStream.close();
-                });
+    
+    // Étape 2: Chercher sur les serveurs distants
+    const remoteUrl = resolveFileUrl(filePath, fileName);
+    
+    if (remoteUrl) {
+        console.log(`🌐 Tentative de téléchargement depuis: ${remoteUrl}`);
+        
+        try {
+            // Vérifier si le fichier existe à distance
+            const exists = await checkRemoteFile(remoteUrl);
+            
+            if (exists) {
+                // Télécharger et servir
+                const cachePath = path.join(CONFIG.CACHE_DIR, 
+                    Buffer.from(remoteUrl).toString('base64').replace(/[^a-zA-Z0-9]/g, ''));
+                
+                const success = await downloadAndCache(remoteUrl, cachePath);
+                
+                if (success) {
+                    // Copier dans l'instance locale pour usage futur
+                    const localDir = path.dirname(fullLocalPath);
+                    if (!fs.existsSync(localDir)) {
+                        fs.mkdirSync(localDir, { recursive: true });
+                    }
+                    fs.copyFileSync(cachePath, fullLocalPath);
+                    
+                    // Servir le fichier
+                    return res.sendFile(cachePath);
+                }
             } else {
-                console.log(`   ❌ Mojang a répondu ${mojangRes.statusCode}.`);
-                sendNotFound(res, filePath);
+                console.log(`❌ Fichier non trouvé sur les serveurs distants: ${fileName}`);
             }
-        });
-        reqToMojang.on('error', (err) => {
-            console.log(`   ❌ Échec de la connexion à Mojang: ${err.message}`);
-            sendNotFound(res, filePath);
-        });
-        reqToMojang.setTimeout(10000, () => {
-            console.log(`   ⏱️  Timeout sur la requête à Mojang.`);
-            reqToMojang.destroy();
-            sendNotFound(res, filePath);
-        });
-        return;
+        } catch (error) {
+            console.log(`⚠️ Erreur téléchargement: ${error.message}`);
+        }
     }
-
-    // Étape 3 : Pour les natives manquantes, créer un placeholder
-    if (isLikelyNative) {
-        console.log(`   🛠️  Création d'un placeholder pour la native: ${filename}`);
+    
+    // Étape 3: Pour les natives, créer un placeholder
+    if (filePath.includes('/natives/') && 
+        (fileName.endsWith('.dll') || fileName.endsWith('.so') || fileName.endsWith('.dylib'))) {
+        console.log(`🛠️ Création placeholder pour native: ${fileName}`);
         const dir = path.dirname(fullLocalPath);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(fullLocalPath, ''); // Fichier vide
-        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': '0' });
-        return res.end();
+        fs.writeFileSync(fullLocalPath, Buffer.from([0x4D, 0x5A])); // Header minimal PE
+        res.writeHead(200, { 
+            'Content-Type': 'application/octet-stream', 
+            'Content-Length': '2' 
+        });
+        return res.end(Buffer.from([0x4D, 0x5A]));
     }
-
-    // Étape 4 : Fichier introuvable partout
-    console.log(`   ❌ Fichier introuvable.`);
-    sendNotFound(res, filePath);
-});
-
-// --- 3. Routes Utilitaires (Check, Prefetch, Nettoyage) ---
-app.get('/check-file/:hash', (req, res) => {
-    const hash = req.params.hash;
-    const prefix = hash.substring(0, 2);
-    const localPath = path.join(__dirname, 'files', 'instances', 'zendariom', 'assets', 'objects', prefix, hash);
-    const exists = fs.existsSync(localPath);
-    res.json({
-        hash,
-        exists_locally: exists,
-        local_path: localPath,
-        mojang_url: `https://resources.download.minecraft.net/${prefix}/${hash}`,
-        your_server_url: `https://${req.get('host')}/files/instances/zendariom/assets/objects/${prefix}/${hash}`
-    });
-});
-
-app.get('/prefetch-assets', async (req, res) => {
-    const instance = req.query.instance || 'zendariom';
-    const specific = req.query.assets ? req.query.assets.split(',') : [
-        '5cca35534cc2ee3529d39b7ccc12b437955e0683',
-        '5df4a02b1ebc550514841fddb7d64b9c497d40b4'
-    ];
-    console.log(`🔄 Pré-téléchargement demandé pour ${instance}`);
-
-    const results = [];
-    for (const asset of specific) {
-        const prefix = asset.substring(0, 2);
-        const localPath = path.join(__dirname, 'files', 'instances', instance, 'assets', 'objects', prefix, asset);
-        if (fs.existsSync(localPath)) {
-            results.push({ asset, status: 'déjà présent' });
-            continue;
-        }
-        const success = await downloadFromMojang(asset, localPath);
-        results.push({ asset, status: success ? 'téléchargé' : 'échec' });
-        await new Promise(r => setTimeout(r, 100)); // Pause
-    }
-    res.json({ instance, results });
-});
-
-app.get('/clean-temp-files', (req, res) => {
-    const instance = req.query.instance || 'zendariom';
-    const instancePath = path.join(__dirname, 'files', 'instances', instance);
-    const deleted = [];
-    function cleanDir(dir) {
-        if (!fs.existsSync(dir)) return;
-        const items = fs.readdirSync(dir);
-        for (const item of items) {
-            const full = path.join(dir, item);
-            const stat = fs.statSync(full);
-            if (stat.isDirectory()) {
-                cleanDir(full);
-                if (fs.readdirSync(full).length === 0) fs.rmdirSync(full);
-            } else if (item.endsWith('.x') || (item.startsWith('jna') && item.includes('.dll'))) {
-                fs.unlinkSync(full);
-                deleted.push(path.relative(instancePath, full));
-            }
-        }
-    }
-    cleanDir(instancePath);
-    res.json({ message: 'Nettoyage terminé.', fichiers_supprimés: deleted });
-});
-
-// --- 4. Route Racine (Page d'Accueil) ---
-app.get('/', (req, res) => {
-    const host = req.get('host');
-    res.json({
-        server: "Terra File Server - Zendarion",
-        features: [
-            "📁 Liste des fichiers: /files?instance=zendariom",
-            "📦 Proxy auto vers Mojang pour assets manquants",
-            "🔍 Vérifier un fichier: /check-file/HASH",
-            "🔄 Pré-télécharger: /prefetch-assets?instance=zendariom",
-            "🧹 Nettoyer fichiers .x: /clean-temp-files?instance=zendariom"
-        ],
-        example: {
-            liste_fichiers: `https://${host}/files?instance=zendariom`,
-            check_probleme: `https://${host}/check-file/5cca35534cc2ee3529d39b7ccc12b437955e0683`,
-            prefetch: `https://${host}/prefetch-assets?instance=zendariom`
-        },
-        note: "Les assets Minecraft manquants sont automatiquement téléchargés depuis resources.download.minecraft.net et mis en cache."
-    });
-});
-
-// --- Fonctions Helper ---
-function sendNotFound(res, filePath) {
+    
+    // Étape 4: Fichier introuvable
+    console.log(`❌ Fichier introuvable: ${filePath}`);
     res.status(404).json({
         error: 'Fichier non trouvé',
+        file: fileName,
         path: filePath,
-        suggestion: 'Le fichier est absent du serveur local et ne peut être récupéré depuis une source externe.'
+        attempted_remote: remoteUrl || 'none',
+        suggestion: 'Le fichier n\'existe pas localement et n\'est pas disponible sur les serveurs Forge/Mojang'
     });
-}
+});
 
-function downloadFromMojang(hash, outputPath) {
-    return new Promise((resolve) => {
-        const prefix = hash.substring(0, 2);
-        const url = `https://resources.download.minecraft.net/${prefix}/${hash}`;
-        const dir = path.dirname(outputPath);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        const fileStream = fs.createWriteStream(outputPath);
-        const request = https.get(url, (response) => {
-            if (response.statusCode === 200) {
-                response.pipe(fileStream);
-                fileStream.on('finish', () => {
-                    fileStream.close();
-                    console.log(`   ✅ Pré-téléchargé: ${hash}`);
-                    resolve(true);
-                });
-            } else {
-                fileStream.close();
-                fs.unlink(outputPath, () => {});
-                console.log(`   ❌ Échec du pré-téléchargement (${response.statusCode}): ${hash}`);
-                resolve(false);
-            }
+// 4. API de téléchargement forcé
+app.get('/api/download-forge-file', async (req, res) => {
+    const { path: filePath, version = '1.20.1' } = req.query;
+    
+    if (!filePath) {
+        return res.status(400).json({ error: 'Paramètre path manquant' });
+    }
+    
+    const fileName = path.basename(filePath);
+    let remoteUrl = null;
+    
+    // Déterminer l'URL Forge
+    if (filePath.includes('forge-')) {
+        remoteUrl = `${CONFIG.FORGE_MAVEN}/net/minecraftforge/forge/${version}/${fileName}`;
+    } else if (filePath.includes('libraries/net/minecraftforge')) {
+        remoteUrl = `${CONFIG.FORGE_MAVEN}/${filePath}`;
+    } else if (fileName.includes('minecraft-forge')) {
+        remoteUrl = `${CONFIG.FORGE_MAVEN_FALLBACK}/${filePath}`;
+    }
+    
+    if (!remoteUrl) {
+        return res.status(400).json({ error: 'Impossible de déterminer l\'URL Forge' });
+    }
+    
+    console.log(`🔄 Téléchargement forcé Forge: ${remoteUrl}`);
+    
+    try {
+        const cachePath = path.join(CONFIG.CACHE_DIR, 
+            Buffer.from(remoteUrl).toString('base64').replace(/[^a-zA-Z0-9]/g, ''));
+        
+        const success = await downloadAndCache(remoteUrl, cachePath);
+        
+        if (success) {
+            res.json({
+                success: true,
+                url: remoteUrl,
+                cached_path: cachePath,
+                size: fs.statSync(cachePath).size,
+                download_url: `https://${req.get('host')}/files/instances/zendariom/${filePath}`
+            });
+        } else {
+            res.status(500).json({ 
+                success: false, 
+                error: 'Échec du téléchargement' 
+            });
+        }
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
         });
-        request.on('error', () => {
-            fileStream.close();
-            fs.unlink(outputPath, () => {});
-            resolve(false);
-        });
-        request.setTimeout(10000, () => {
-            request.destroy();
-            fileStream.close();
-            fs.unlink(outputPath, () => {});
-            resolve(false);
-        });
+    }
+});
+
+// 5. Gestion du cache
+app.get('/api/cache/info', (req, res) => {
+    const cacheFiles = fs.readdirSync(CONFIG.CACHE_DIR);
+    const stats = cacheFiles.map(file => {
+        const filePath = path.join(CONFIG.CACHE_DIR, file);
+        const stat = fs.statSync(filePath);
+        return {
+            file,
+            size: stat.size,
+            modified: stat.mtime,
+            age: Date.now() - stat.mtimeMs
+        };
     });
-}
+    
+    res.json({
+        cache_dir: CONFIG.CACHE_DIR,
+        total_files: cacheFiles.length,
+        total_size: stats.reduce((sum, s) => sum + s.size, 0),
+        ttl: CONFIG.CACHE_TTL,
+        files: stats
+    });
+});
 
-// --- Démarrage du Serveur ---
+app.delete('/api/cache/clear', (req, res) => {
+    const cacheFiles = fs.readdirSync(CONFIG.CACHE_DIR);
+    let deleted = 0;
+    
+    cacheFiles.forEach(file => {
+        const filePath = path.join(CONFIG.CACHE_DIR, file);
+        fs.unlinkSync(filePath);
+        deleted++;
+    });
+    
+    res.json({
+        success: true,
+        deleted_count: deleted,
+        message: 'Cache vidé'
+    });
+});
+
+// 6. Page d'accueil
+app.get('/', (req, res) => {
+    res.json({
+        server: 'Zendarion Server - Fallback Forge/Mojang',
+        version: '2.0',
+        features: [
+            '✅ Téléchargement automatique depuis Forge/Mojang',
+            '🔄 Cache intelligent des fichiers',
+            '📦 Support Forge 1.20.1+',
+            '🔧 Placeholder pour natives',
+            '🧹 Gestion du cache via API'
+        ],
+        endpoints: {
+            config: `https://${req.get('host')}/files/instances.json`,
+            files: `https://${req.get('host')}/files?instance=zendariom`,
+            download_api: `https://${req.get('host')}/api/download-forge-file?path=forge-1.20.1-47.1.0-installer.jar`,
+            cache_info: `https://${req.get('host')}/api/cache/info`,
+            cache_clear: `https://${req.get('host')}/api/cache/clear`
+        },
+        stats: {
+            cache_size: fs.readdirSync(CONFIG.CACHE_DIR).length,
+            cache_dir: CONFIG.CACHE_DIR
+        }
+    });
+});
+
+// ================= DÉMARRAGE =================
 app.listen(port, () => {
     console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║        Serveur Zendarion Config - Opérationnel              ║
+║   ZENDARION SERVER - FALLBACK FORGE/MOJANG ACTIVÉ           ║
 ╚══════════════════════════════════════════════════════════════╝
-📡  Port: ${port}
-🌐  URL: https://zendarion-config.onrender.com
-🎯  Format de réponse: TABLEAU [] (compatible minecraft-java-core)
-🛡️  Gestion des fichiers .x/jna : Placeholder automatique
-🔀  Fallback Assets : Proxy vers Mojang activé
+📡 Port: ${port}
+🌐 URL: https://zendarion-config.onrender.com
+🎯 Target: Forge 1.20.1
+
+🔗 Endpoints:
+   📋 Config: https://zendarion-config.onrender.com/files/instances.json
+   📁 Files:  https://zendarion-config.onrender.com/files?instance=zendariom
+   ⬇️  Download API: https://zendarion-config.onrender.com/api/download-forge-file
+
+🔄 Fonctionnalités:
+   • Téléchargement auto depuis Forge/Mojang
+   • Cache 24h des fichiers
+   • Support natives Windows/Linux/Mac
+   • Gestion fichiers temporaires (.x, .tmp)
+
+💾 Cache: ${CONFIG.CACHE_DIR}
+✅ Serveur prêt. Les fichiers manquants seront téléchargés automatiquement.
 `);
-    // Vérification rapide de la structure
-    const instancesPath = path.join(__dirname, 'files', 'instances');
-    if (!fs.existsSync(instancesPath)) {
-        fs.mkdirSync(instancesPath, { recursive: true });
-        console.log(`📁  Dossier 'instances' créé.`);
-    }
 });
