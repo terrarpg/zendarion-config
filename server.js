@@ -2,75 +2,61 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
-const http = require('http');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// CORS
+// --- Configuration CORS ---
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
     next();
 });
 
-// Middleware pour logger les requêtes
-app.use((req, res, next) => {
-    console.log(`📨 ${req.method} ${req.path}`);
-    next();
-});
-
-// Route principale - Liste des fichiers
+// --- 1. Route Principale : Liste des fichiers (RETOURNE UN TABLEAU) ---
 app.get('/files/', (req, res) => {
     const instanceName = req.query.instance;
-    
-    if (!instanceName) {
-        return res.json([]);
-    }
-    
+    if (!instanceName) return res.json([]); // Retourne un tableau vide
+
     const instancePath = path.join(__dirname, 'files', 'instances', instanceName);
-    
-    console.log(`🔍 Scan instance: ${instanceName}`);
-    
+    console.log(`🔍 Scan de l'instance: "${instanceName}"`);
+
     if (!fs.existsSync(instancePath)) {
-        console.log(`❌ Instance non trouvée: ${instancePath}`);
+        console.log(`❌ Instance non trouvée.`);
         return res.json([]);
     }
 
-    // Fonction pour scanner les fichiers
     function scanDirectory(dir, basePath = '') {
         const results = [];
-        
         try {
             const items = fs.readdirSync(dir);
-            
             for (const item of items) {
                 const fullPath = path.join(dir, item);
                 const relativePath = basePath ? `${basePath}/${item}` : item;
-                
+
                 try {
                     const stats = fs.statSync(fullPath);
-                    
+
                     if (stats.isDirectory()) {
-                        // Scanner les sous-dossiers
-                        const subItems = scanDirectory(fullPath, relativePath);
-                        results.push(...subItems);
+                        // Scanner récursivement les sous-dossiers
+                        results.push(...scanDirectory(fullPath, relativePath));
                     } else {
-                        // CRITIQUE : Pour les assets Minecraft, utiliser l'URL Mojang
-                        // Pour les autres fichiers, utiliser notre serveur
+                        // IGNORE les fichiers temporaires .x et JNA
+                        if (item.endsWith('.x') || (item.startsWith('jna') && item.includes('.dll'))) {
+                            console.log(`   ⚠️ Ignoré (fichier temp): ${relativePath}`);
+                            continue;
+                        }
+
                         let fileUrl;
-                        
-                        // Vérifier si c'est un asset Minecraft (hash SHA1)
-                        if (item.length === 40 && /^[0-9a-f]{40}$/.test(item) && 
-                            relativePath.includes('assets/objects/')) {
-                            // Asset Minecraft -> utiliser URL Mojang directement
+                        // Détection d'un hash SHA1 (Asset Minecraft)
+                        if (item.length === 40 && /^[0-9a-f]{40}$/.test(item) && relativePath.includes('assets/objects/')) {
                             const prefix = item.substring(0, 2);
-                            fileUrl = `https://resources.download.minecraft.net/${prefix}/${item}`;
+                            fileUrl = `https://resources.download.minecraft.net/${prefix}/${item}`; // URL Mojang
                         } else {
-                            // Autre fichier -> utiliser notre serveur
+                            // Pour tous les autres fichiers (libs, configs, mods...)
                             fileUrl = `https://${req.get('host')}/files/instances/${instanceName}/${relativePath.replace(/\\/g, '/')}`;
                         }
-                        
+
                         results.push({
                             name: item,
                             path: relativePath.replace(/\\/g, '/'),
@@ -80,352 +66,249 @@ app.get('/files/', (req, res) => {
                             modified: stats.mtime.toISOString()
                         });
                     }
-                } catch (error) {
-                    console.log(`⚠️ Erreur fichier ${item}: ${error.message}`);
-                }
+                } catch (err) { /* Ignorer les erreurs de fichier individuel */ }
             }
-        } catch (error) {
-            console.log(`⚠️ Erreur dossier ${dir}: ${error.message}`);
-        }
-        
+        } catch (err) { /* Ignorer les erreurs de dossier */ }
         return results;
     }
 
     try {
-        const files = scanDirectory(instancePath);
-        console.log(`✅ ${files.length} fichiers trouvés`);
-        
-        // CRITIQUE : Retourner directement le tableau
-        res.json(files);
-        
+        const fileList = scanDirectory(instancePath);
+        console.log(`✅ ${fileList.length} fichiers valides listés.`);
+        res.json(fileList); // CRITIQUE : Retourne directement le tableau.
     } catch (error) {
-        console.error('❌ Erreur scan:', error);
+        console.error('❌ Erreur lors du scan:', error);
         res.status(500).json([]);
     }
 });
 
-// Route INTELLIGENTE pour servir les fichiers avec fallback sur Mojang
+// --- 2. Route de Téléchargement Intelligent avec Fallback ---
 app.get('/files/instances/:instance/*', (req, res) => {
     const instanceName = req.params.instance;
     const filePath = req.params[0];
-    const fullPath = path.join(__dirname, 'files', 'instances', instanceName, filePath);
-    
-    console.log(`📤 Demande fichier: ${filePath}`);
-    
-    // Vérifier si c'est un asset Minecraft (hash SHA1)
+    const fullLocalPath = path.join(__dirname, 'files', 'instances', instanceName, filePath);
     const filename = path.basename(filePath);
-    const isMinecraftAsset = filename.length === 40 && /^[0-9a-f]{40}$/.test(filename) && 
-                             filePath.includes('assets/objects/');
-    
-    // Fonction pour servir depuis notre serveur
-    const serveFromOurServer = () => {
-        if (fs.existsSync(fullPath)) {
-            const stats = fs.statSync(fullPath);
-            
-            // Vérifier si le fichier n'est pas vide
-            if (stats.size > 0) {
-                console.log(`✅ Servi depuis notre serveur: ${stats.size} bytes`);
-                
-                // Gérer les requêtes Range (téléchargements partiels)
-                const range = req.headers.range;
-                if (range) {
-                    const parts = range.replace(/bytes=/, "").split("-");
-                    const start = parseInt(parts[0], 10);
-                    const end = parts[1] ? parseInt(parts[1], 10) : stats.size - 1;
-                    
-                    const chunksize = (end - start) + 1;
-                    const file = fs.createReadStream(fullPath, { start, end });
-                    
-                    res.writeHead(206, {
-                        'Content-Range': `bytes ${start}-${end}/${stats.size}`,
-                        'Accept-Ranges': 'bytes',
-                        'Content-Length': chunksize,
-                        'Content-Type': 'application/octet-stream'
-                    });
-                    
-                    file.pipe(res);
-                } else {
-                    // Téléchargement complet
-                    res.sendFile(fullPath);
-                }
-                return true;
-            } else {
-                console.log(`⚠️ Fichier vide (0 bytes), fallback sur Mojang`);
-                return false;
-            }
-        }
-        return false;
-    };
-    
-    // Fonction pour servir depuis Mojang (proxy)
-    const serveFromMojang = () => {
-        if (!isMinecraftAsset) {
-            console.log(`❌ Ce n'est pas un asset Minecraft, impossible de proxy`);
-            return false;
-        }
-        
-        const prefix = filename.substring(0, 2);
-        const mojangUrl = `https://resources.download.minecraft.net/${prefix}/${filename}`;
-        
-        console.log(`🌐 Proxy vers Mojang: ${mojangUrl}`);
-        
-        return new Promise((resolve) => {
-            https.get(mojangUrl, (mojangResponse) => {
-                if (mojangResponse.statusCode === 200) {
-                    console.log(`✅ Mojang: ${mojangResponse.statusCode}, ${mojangResponse.headers['content-length']} bytes`);
-                    
-                    // Streamer vers le client
-                    res.writeHead(mojangResponse.statusCode, {
-                        'Content-Type': mojangResponse.headers['content-type'] || 'application/octet-stream',
-                        'Content-Length': mojangResponse.headers['content-length']
-                    });
-                    
-                    mojangResponse.pipe(res);
-                    
-                    // Sauvegarder localement pour les prochaines fois
-                    const localDir = path.dirname(fullPath);
-                    if (!fs.existsSync(localDir)) {
-                        fs.mkdirSync(localDir, { recursive: true });
-                    }
-                    
-                    const fileStream = fs.createWriteStream(fullPath);
-                    mojangResponse.pipe(fileStream);
-                    
-                    fileStream.on('finish', () => {
-                        fileStream.close();
-                        console.log(`💾 Sauvegardé localement: ${filePath}`);
-                    });
-                    
-                    resolve(true);
-                } else {
-                    console.log(`❌ Mojang: ${mojangResponse.statusCode}`);
-                    resolve(false);
-                }
-            }).on('error', (error) => {
-                console.error(`❌ Erreur proxy Mojang: ${error.message}`);
-                resolve(false);
-            });
-        });
-    };
-    
-    // Stratégie de fallback intelligente
-    const serveFile = async () => {
-        // 1. Essayer notre serveur d'abord
-        if (serveFromOurServer()) {
-            return;
-        }
-        
-        // 2. Si échec et c'est un asset Minecraft, essayer Mojang
-        if (isMinecraftAsset) {
-            const mojangSuccess = await serveFromMojang();
-            if (mojangSuccess) {
-                return;
-            }
-        }
-        
-        // 3. Tout a échoué
-        console.log(`❌ Fichier non trouvé: ${filePath}`);
-        res.status(404).json({
-            error: 'Fichier non trouvé',
-            path: filePath,
-            tried: ['Serveur local', isMinecraftAsset ? 'Mojang' : 'Non applicable']
-        });
-    };
-    
-    serveFile().catch(error => {
-        console.error('❌ Erreur serveur:', error);
-        res.status(500).json({ error: 'Erreur interne du serveur' });
-    });
-});
 
-// Route pour pré-télécharger les assets problématiques
-app.get('/prefetch-assets', async (req, res) => {
-    const instanceName = req.query.instance || 'zendariom';
-    const specificAssets = req.query.assets ? req.query.assets.split(',') : [];
-    
-    console.log(`🔄 Pré-téléchargement assets pour: ${instanceName}`);
-    
-    // Liste des assets connus problématiques
-    const problemAssets = specificAssets.length > 0 ? specificAssets : [
-        '5cca35534cc2ee3529d39b7ccc12b437955e0683',
-        '5df4a02b1ebc550514841fddb7d64b9c497d40b4',
-        '5cd1caeb2b7c35e58c57a90eed97be8cd893e499',
-        '5c39dec69b8093f9accf712fe21f9f8bae102991',
-        '5cb45773f1d399db399d0214efc75f3ade0f81d5',
-        '5c971029d9284676dce1dda2c9d202f8c47163b2'
-    ];
-    
-    const results = [];
-    
-    for (const asset of problemAssets) {
-        const prefix = asset.substring(0, 2);
-        const mojangUrl = `https://resources.download.minecraft.net/${prefix}/${asset}`;
-        const localPath = path.join(__dirname, 'files', 'instances', instanceName, 'assets', 'objects', prefix, asset);
-        
-        // Vérifier si déjà présent
-        if (fs.existsSync(localPath)) {
-            const stats = fs.statSync(localPath);
-            if (stats.size > 0) {
-                results.push({ asset, status: 'déjà présent', size: stats.size });
-                continue;
-            }
-        }
-        
-        // Télécharger depuis Mojang
-        try {
-            const success = await downloadFromMojang(asset, localPath);
-            results.push({ 
-                asset, 
-                status: success ? 'téléchargé' : 'échec',
-                url: mojangUrl
-            });
-            
-            // Pause pour éviter de surcharger
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-        } catch (error) {
-            results.push({ asset, status: 'erreur', error: error.message });
+    console.log(`📥 Demande: /${filePath}`);
+
+    // STRATÉGIE : Gestion des fichiers temporaires (.x)
+    if (filename.endsWith('.x') || (filename.startsWith('jna') && filename.includes('.dll'))) {
+        console.log(`   🛡️  Fichier temporaire détecté. Réponse avec placeholder vide.`);
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': '0' });
+        return res.end();
+    }
+
+    const isMinecraftAsset = filename.length === 40 && /^[0-9a-f]{40}$/.test(filename) && filePath.includes('assets/objects/');
+    const isLikelyNative = filePath.includes('/natives/') && (filename.endsWith('.dll') || filename.endsWith('.so') || filename.endsWith('.dylib'));
+
+    // Étape 1 : Servir depuis le système de fichiers local
+    if (fs.existsSync(fullLocalPath)) {
+        const stats = fs.statSync(fullLocalPath);
+        if (stats.size > 0) {
+            console.log(`   ✅ Servi depuis le cache local (${stats.size} octets).`);
+            return res.sendFile(fullLocalPath);
         }
     }
-    
-    res.json({
-        instance: instanceName,
-        total: problemAssets.length,
-        results: results
-    });
+
+    // Étape 2 : Pour les assets Minecraft, proxy vers Mojang
+    if (isMinecraftAsset) {
+        const prefix = filename.substring(0, 2);
+        const mojangUrl = `https://resources.download.minecraft.net/${prefix}/${filename}`;
+        console.log(`   🌐 Proxy vers Mojang: ${mojangUrl}`);
+
+        const reqToMojang = https.get(mojangUrl, (mojangRes) => {
+            if (mojangRes.statusCode === 200) {
+                // 1. Streamer la réponse au client
+                res.writeHead(200, {
+                    'Content-Type': mojangRes.headers['content-type'] || 'application/octet-stream',
+                    'Content-Length': mojangRes.headers['content-length']
+                });
+                mojangRes.pipe(res);
+
+                // 2. Sauvegarder en cache pour la prochaine fois
+                const dir = path.dirname(fullLocalPath);
+                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+                const fileStream = fs.createWriteStream(fullLocalPath);
+                mojangRes.pipe(fileStream);
+                fileStream.on('finish', () => {
+                    console.log(`   💾 Asset sauvegardé en cache: ${filename}`);
+                    fileStream.close();
+                });
+            } else {
+                console.log(`   ❌ Mojang a répondu ${mojangRes.statusCode}.`);
+                sendNotFound(res, filePath);
+            }
+        });
+        reqToMojang.on('error', (err) => {
+            console.log(`   ❌ Échec de la connexion à Mojang: ${err.message}`);
+            sendNotFound(res, filePath);
+        });
+        reqToMojang.setTimeout(10000, () => {
+            console.log(`   ⏱️  Timeout sur la requête à Mojang.`);
+            reqToMojang.destroy();
+            sendNotFound(res, filePath);
+        });
+        return;
+    }
+
+    // Étape 3 : Pour les natives manquantes, créer un placeholder
+    if (isLikelyNative) {
+        console.log(`   🛠️  Création d'un placeholder pour la native: ${filename}`);
+        const dir = path.dirname(fullLocalPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(fullLocalPath, ''); // Fichier vide
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': '0' });
+        return res.end();
+    }
+
+    // Étape 4 : Fichier introuvable partout
+    console.log(`   ❌ Fichier introuvable.`);
+    sendNotFound(res, filePath);
 });
 
-// Fonction utilitaire pour télécharger depuis Mojang
-function downloadFromMojang(hash, outputPath) {
-    return new Promise((resolve, reject) => {
-        const prefix = hash.substring(0, 2);
-        const url = `https://resources.download.minecraft.net/${prefix}/${hash}`;
-        
-        // Créer le dossier si nécessaire
-        const dir = path.dirname(outputPath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        
-        const file = fs.createWriteStream(outputPath);
-        
-        https.get(url, (response) => {
-            if (response.statusCode !== 200) {
-                file.close();
-                fs.unlinkSync(outputPath);
-                reject(new Error(`HTTP ${response.statusCode}`));
-                return;
-            }
-            
-            response.pipe(file);
-            
-            file.on('finish', () => {
-                file.close();
-                resolve(true);
-            });
-            
-        }).on('error', (error) => {
-            file.close();
-            if (fs.existsSync(outputPath)) {
-                fs.unlinkSync(outputPath);
-            }
-            reject(error);
-        });
-        
-        // Timeout
-        setTimeout(() => {
-            file.close();
-            if (fs.existsSync(outputPath)) {
-                fs.unlinkSync(outputPath);
-            }
-            reject(new Error('Timeout'));
-        }, 30000);
-    });
-}
-
-// Route de vérification
+// --- 3. Routes Utilitaires (Check, Prefetch, Nettoyage) ---
 app.get('/check-file/:hash', (req, res) => {
     const hash = req.params.hash;
     const prefix = hash.substring(0, 2);
-    
     const localPath = path.join(__dirname, 'files', 'instances', 'zendariom', 'assets', 'objects', prefix, hash);
-    const mojangUrl = `https://resources.download.minecraft.net/${prefix}/${hash}`;
-    const ourUrl = `https://${req.get('host')}/files/instances/zendariom/assets/objects/${prefix}/${hash}`;
-    
-    const existsLocally = fs.existsSync(localPath);
-    let localSize = 0;
-    
-    if (existsLocally) {
-        const stats = fs.statSync(localPath);
-        localSize = stats.size;
-    }
-    
+    const exists = fs.existsSync(localPath);
     res.json({
-        hash: hash,
-        local: {
-            exists: existsLocally,
-            size: localSize,
-            path: localPath
-        },
-        urls: {
-            our_server: ourUrl,
-            mojang: mojangUrl
-        },
-        test: `curl -I "${ourUrl}"`
+        hash,
+        exists_locally: exists,
+        local_path: localPath,
+        mojang_url: `https://resources.download.minecraft.net/${prefix}/${hash}`,
+        your_server_url: `https://${req.get('host')}/files/instances/zendariom/assets/objects/${prefix}/${hash}`
     });
 });
 
-// Page d'accueil avec infos
+app.get('/prefetch-assets', async (req, res) => {
+    const instance = req.query.instance || 'zendariom';
+    const specific = req.query.assets ? req.query.assets.split(',') : [
+        '5cca35534cc2ee3529d39b7ccc12b437955e0683',
+        '5df4a02b1ebc550514841fddb7d64b9c497d40b4'
+    ];
+    console.log(`🔄 Pré-téléchargement demandé pour ${instance}`);
+
+    const results = [];
+    for (const asset of specific) {
+        const prefix = asset.substring(0, 2);
+        const localPath = path.join(__dirname, 'files', 'instances', instance, 'assets', 'objects', prefix, asset);
+        if (fs.existsSync(localPath)) {
+            results.push({ asset, status: 'déjà présent' });
+            continue;
+        }
+        const success = await downloadFromMojang(asset, localPath);
+        results.push({ asset, status: success ? 'téléchargé' : 'échec' });
+        await new Promise(r => setTimeout(r, 100)); // Pause
+    }
+    res.json({ instance, results });
+});
+
+app.get('/clean-temp-files', (req, res) => {
+    const instance = req.query.instance || 'zendariom';
+    const instancePath = path.join(__dirname, 'files', 'instances', instance);
+    const deleted = [];
+    function cleanDir(dir) {
+        if (!fs.existsSync(dir)) return;
+        const items = fs.readdirSync(dir);
+        for (const item of items) {
+            const full = path.join(dir, item);
+            const stat = fs.statSync(full);
+            if (stat.isDirectory()) {
+                cleanDir(full);
+                if (fs.readdirSync(full).length === 0) fs.rmdirSync(full);
+            } else if (item.endsWith('.x') || (item.startsWith('jna') && item.includes('.dll'))) {
+                fs.unlinkSync(full);
+                deleted.push(path.relative(instancePath, full));
+            }
+        }
+    }
+    cleanDir(instancePath);
+    res.json({ message: 'Nettoyage terminé.', fichiers_supprimés: deleted });
+});
+
+// --- 4. Route Racine (Page d'Accueil) ---
 app.get('/', (req, res) => {
+    const host = req.get('host');
     res.json({
-        server: 'Terra File Server avec fallback Mojang',
+        server: "Terra File Server - Zendarion",
         features: [
-            '📁 Liste des fichiers: /files?instance=zendariom',
-            '📦 Proxy automatique vers Mojang pour les assets manquants',
-            '🔍 Vérifier un fichier: /check-file/HASH',
-            '🔄 Pré-télécharger: /prefetch-assets?instance=zendariom'
+            "📁 Liste des fichiers: /files?instance=zendariom",
+            "📦 Proxy auto vers Mojang pour assets manquants",
+            "🔍 Vérifier un fichier: /check-file/HASH",
+            "🔄 Pré-télécharger: /prefetch-assets?instance=zendariom",
+            "🧹 Nettoyer fichiers .x: /clean-temp-files?instance=zendariom"
         ],
         example: {
-            liste_fichiers: `https://${req.get('host')}/files?instance=zendariom`,
-            check_probleme: `https://${req.get('host')}/check-file/5cca35534cc2ee3529d39b7ccc12b437955e0683`,
-            prefetch: `https://${req.get('host')}/prefetch-assets?instance=zendariom`
+            liste_fichiers: `https://${host}/files?instance=zendariom`,
+            check_probleme: `https://${host}/check-file/5cca35534cc2ee3529d39b7ccc12b437955e0683`,
+            prefetch: `https://${host}/prefetch-assets?instance=zendariom`
         },
-        note: 'Les assets Minecraft sont automatiquement proxy vers resources.download.minecraft.net si manquants localement'
+        note: "Les assets Minecraft manquants sont automatiquement téléchargés depuis resources.download.minecraft.net et mis en cache."
     });
 });
 
-// Gestion des erreurs
-app.use((error, req, res, next) => {
-    console.error('🔥 Erreur:', error);
-    res.status(500).json({ 
-        error: 'Erreur interne',
-        message: error.message 
+// --- Fonctions Helper ---
+function sendNotFound(res, filePath) {
+    res.status(404).json({
+        error: 'Fichier non trouvé',
+        path: filePath,
+        suggestion: 'Le fichier est absent du serveur local et ne peut être récupéré depuis une source externe.'
     });
-});
+}
 
-// Démarrer le serveur
+function downloadFromMojang(hash, outputPath) {
+    return new Promise((resolve) => {
+        const prefix = hash.substring(0, 2);
+        const url = `https://resources.download.minecraft.net/${prefix}/${hash}`;
+        const dir = path.dirname(outputPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const fileStream = fs.createWriteStream(outputPath);
+        const request = https.get(url, (response) => {
+            if (response.statusCode === 200) {
+                response.pipe(fileStream);
+                fileStream.on('finish', () => {
+                    fileStream.close();
+                    console.log(`   ✅ Pré-téléchargé: ${hash}`);
+                    resolve(true);
+                });
+            } else {
+                fileStream.close();
+                fs.unlink(outputPath, () => {});
+                console.log(`   ❌ Échec du pré-téléchargement (${response.statusCode}): ${hash}`);
+                resolve(false);
+            }
+        });
+        request.on('error', () => {
+            fileStream.close();
+            fs.unlink(outputPath, () => {});
+            resolve(false);
+        });
+        request.setTimeout(10000, () => {
+            request.destroy();
+            fileStream.close();
+            fs.unlink(outputPath, () => {});
+            resolve(false);
+        });
+    });
+}
+
+// --- Démarrage du Serveur ---
 app.listen(port, () => {
     console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║          SERVEUR AVEC FALLBACK AUTOMATIQUE MOJANG           ║
+║        Serveur Zendarion Config - Opérationnel              ║
 ╚══════════════════════════════════════════════════════════════╝
-📡 Port: ${port}
-🌐 URL: http://localhost:${port}
-
-🎯 FONCTIONNALITÉS:
-   ✅ Liste des fichiers au format correct (tableau [])
-   🔄 Proxy automatique vers Mojang pour les assets manquants
-   💾 Cache local des assets téléchargés
-   📊 Monitoring des fichiers problématiques
-
-🔗 ROUTES:
-   /files?instance=zendariom          → Liste des fichiers
-   /check-file/:hash                  → Vérifier un fichier
-   /prefetch-assets?instance=zendariom → Pré-télécharger les assets
-   /files/instances/zendariom/*       → Télécharger un fichier
-
-📝 NOTE: Si un asset Minecraft est manquant localement, il sera
-         automatiquement téléchargé depuis les serveurs Mojang
-         et sauvegardé localement pour les prochaines fois.
+📡  Port: ${port}
+🌐  URL: https://zendarion-config.onrender.com
+🎯  Format de réponse: TABLEAU [] (compatible minecraft-java-core)
+🛡️  Gestion des fichiers .x/jna : Placeholder automatique
+🔀  Fallback Assets : Proxy vers Mojang activé
 `);
+    // Vérification rapide de la structure
+    const instancesPath = path.join(__dirname, 'files', 'instances');
+    if (!fs.existsSync(instancesPath)) {
+        fs.mkdirSync(instancesPath, { recursive: true });
+        console.log(`📁  Dossier 'instances' créé.`);
+    }
 });
