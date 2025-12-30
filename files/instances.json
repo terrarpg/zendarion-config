@@ -1,0 +1,27 @@
+{
+  "instances": [
+    {
+      "name": "Terra-2",
+      "url": "http://localhost:3000/files/?instance=Terra-2",
+      "minecraft_version": "1.21.1",
+      "loader": "forge",
+      "loader_version": "latest",
+      "verify": true,
+      "ignored": [
+        "config",
+        "logs",
+        "resourcepacks",
+        "shaderpacks",
+        "options.txt",
+        "optionsof.txt"
+      ],
+      "whitelist": [],
+      "whitelistActive": false,
+      "status": {
+        "nameServer": "Zendariom",
+        "ip": "91.197.6.16",
+        "port": 26710
+      }
+    }
+  ]
+}
