@@ -1,19 +1,18 @@
 {
   "instances": [
     {
-      "name": "Terra-2",
-      "url": "http://localhost:3000/files/?instance=Terra-2",
-      "minecraft_version": "1.21.1",
+      "name": "zendariom",
+      "url": "https://zendarion-config.onrender.com/files/?instance=zendariom",
+      "minecraft_version": "1.20.1",
       "loader": "forge",
       "loader_version": "latest",
       "verify": true,
       "ignored": [
         "config",
         "logs",
+        "Mods",
         "resourcepacks",
-        "shaderpacks",
-        "options.txt",
-        "optionsof.txt"
+
       ],
       "whitelist": [],
       "whitelistActive": false,
