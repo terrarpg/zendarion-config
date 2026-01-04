@@ -7,7 +7,6 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ================= CONFIGURATION OPTIMISÉE =================
-const CONFIG = {
     SERVER_NAME: 'Zendariom UltraFast Server',
     VERSION: '3.0.0',
     
