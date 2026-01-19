@@ -4,6 +4,9 @@ const fs = require('fs');
 const app = express();
 const port = 3000;
 
+// Configuration du domaine
+const DOMAIN_URL = 'https://zendarion-config.onrender.com';
+
 // Middleware pour servir les fichiers statiques
 app.use('/files', express.static(path.join(__dirname, 'files')));
 
@@ -48,12 +51,11 @@ app.get('/files/', (req, res) => {
                             const subFiles = scanAllFiles(fullPath, relativePath);
                             allFiles = allFiles.concat(subFiles);
                         } else {
-                            // Ajouter le fichier
                             allFiles.push({
                                 name: item,
                                 path: relativePath,
                                 size: stats.size,
-                                url: `/files/instances/${instanceName}/${relativePath}`,
+                                url: `${DOMAIN_URL}/files/instances/${instanceName}/${relativePath}`, // URL complète avec domaine
                                 type: 'file',
                                 modified: stats.mtime
                             });
@@ -72,13 +74,45 @@ app.get('/files/', (req, res) => {
         // Scanner TOUS les fichiers de l'instance
         const allFiles = scanAllFiles(instancePath);
         
-        console.log(`Total fichiers trouvés: ${allFiles.length}`);
+        // Filtrer et renommer uniquement les fichiers .jar
+        const jarFiles = allFiles.filter(file => file.name.endsWith('.jar'));
+        const otherFiles = allFiles.filter(file => !file.name.endsWith('.jar'));
+        
+        // Renommer les fichiers .jar avec numérotation
+        const renamedJarFiles = jarFiles.map((file, index) => {
+            const number = (index + 1).toString().padStart(2, '0'); // 01, 02, 03, etc.
+            const displayName = `${instanceName}_${number}.jar`;
+            
+            return {
+                ...file,
+                name: displayName,
+                originalName: file.name // Garder le nom original
+            };
+        });
+        
+        // Combiner tous les fichiers
+        const finalFiles = [...renamedJarFiles, ...otherFiles];
+        
+        console.log(`Total fichiers trouvés: ${finalFiles.length}`);
+        console.log(`Fichiers .jar (mods): ${jarFiles.length}`);
+        console.log(`Autres fichiers: ${otherFiles.length}`);
+        
+        // Afficher le renommage des mods pour debug
+        if (jarFiles.length > 0) {
+            console.log('Renommage des mods:');
+            renamedJarFiles.slice(0, 10).forEach(file => {
+                console.log(`  ${file.originalName} → ${file.name}`);
+            });
+            if (jarFiles.length > 10) {
+                console.log(`  ... et ${jarFiles.length - 10} autres`);
+            }
+        }
         
         // Afficher les dossiers principaux pour debug
         const mainDirs = fs.readdirSync(instancePath);
         console.log(`Dossiers principaux: ${mainDirs.join(', ')}`);
         
-        res.json(allFiles);
+        res.json(finalFiles);
         
     } catch (error) {
         console.error('Erreur scan complet:', error);
@@ -132,8 +166,11 @@ app.get('/instances', (req, res) => {
 app.listen(port, () => {
     console.log(`=== Terra File Server Démaré ===`);
     console.log(`URL: http://localhost:${port}`);
+    console.log(`URL publique: ${DOMAIN_URL}`);
     console.log(`Dossier instances: ${path.join(__dirname, 'files', 'instances')}`);
     console.log(`Mode: SCAN COMPLET - Tous les fichiers servis`);
+    console.log(`Renommage des mods: activé`);
+    console.log(`Format: nominstance_01.jar, nominstance_02.jar, etc.`);
     console.log(`===========================================`);
     
     // Afficher les instances disponibles au démarrage
