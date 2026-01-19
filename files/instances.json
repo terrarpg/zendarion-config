@@ -1,27 +1,28 @@
 {
-  "instances": [
-    {
-      "name": "Terra-2",
-      "url": "http://localhost:3000/files/?instance=Terra-2",
-      "minecraft_version": "1.21.1",
-      "loader": "forge",
-      "loader_version": "latest",
-      "verify": true,
-      "ignored": [
-        "config",
-        "logs",
-        "resourcepacks",
-        "shaderpacks",
-        "options.txt",
-        "optionsof.txt"
-      ],
-      "whitelist": [],
-      "whitelistActive": false,
-      "status": {
-        "nameServer": "Zendariom",
-        "ip": "91.197.6.16",
-        "port": 26710
-      }
+  "zendariom": {
+    "name": "zendariom",
+    "url": "https://zendarion-config.onrender.com/files?instance=zendariom",
+    "loadder": {
+      "minecraft_version": "1.20.1",
+      "loadder_type": "Forge",
+      "loadder_version": "latest"
+    },
+    "verify": true,
+    "ignored": [
+      "config",
+      "logs",
+      "resourcepacks",
+      "options.txt",
+      "optionsof.txt"
+    ],
+    "whitelist": [
+      "Luuxis"
+    ],
+    "whitelistActive": false,
+    "status": {
+    "nameServer": "ZENDARIOM",
+    "ip": "91.197.6.16",
+    "port": 26710
     }
-  ]
+  }
 }
