@@ -1,3 +1,4 @@
 {
-  "title_screen": true
+  "connect_screen": true,
+  "title_screen": false
 }
